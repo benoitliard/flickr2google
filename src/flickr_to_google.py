@@ -17,29 +17,29 @@ class APIQuotaExceeded(Exception):
 
 class PhotoTransferer:
     def __init__(self):
-        # Configuration du logging
+        # Logging configuration
         logging.basicConfig(
             filename=f'transfer_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log',
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
         
-        # Clés API Flickr
+        # Flickr API keys
         self.FLICKR_API_KEY = os.getenv('FLICKR_API_KEY')
         self.FLICKR_API_SECRET = os.getenv('FLICKR_API_SECRET')
         
         if not self.FLICKR_API_KEY or not self.FLICKR_API_SECRET:
-            raise ValueError("Les clés API Flickr ne sont pas configurées dans le fichier .env")
+            raise ValueError("Flickr API keys are not configured in the .env file")
         
-        # Limites des API
-        self.GOOGLE_PHOTOS_DAILY_UPLOADS = 75000  # Limite quotidienne
+        # API limits
+        self.GOOGLE_PHOTOS_DAILY_UPLOADS = 75000  # Daily limit
         self.FLICKR_CALLS_PER_HOUR = 3600
         self.upload_count = 0
         self.last_upload_reset = datetime.now()
         self.flickr_calls = 0
         self.last_flickr_reset = datetime.now()
         
-        # Configuration Google Photos
+        # Google Photos configuration
         self.SCOPES = ['https://www.googleapis.com/auth/photoslibrary',
                       'https://www.googleapis.com/auth/photoslibrary.sharing']
         
@@ -52,41 +52,41 @@ class PhotoTransferer:
             )
             
             if not self.flickr.token_valid(perms='write'):
-                print("Vous allez être redirigé vers Flickr pour autoriser l'application...")
+                print("You will be redirected to Flickr to authorize the application...")
                 self.flickr.get_request_token(oauth_callback='oob')
                 authorize_url = self.flickr.auth_url(perms='write')
                 
-                print(f'\nOuvrez cette URL dans votre navigateur pour autoriser l\'application:')
+                print(f'\nOpen this URL in your browser to authorize the application:')
                 print(authorize_url)
                 
-                verifier = input('\nAprès autorisation, entrez le code de vérification ici: ').strip()
+                verifier = input('\nAfter authorization, enter the verification code here: ').strip()
                 
                 self.flickr.get_access_token(verifier)
             
             self.google_photos = self._authenticate_google()
         except Exception as e:
-            logging.error(f"Erreur d'initialisation: {str(e)}")
+            logging.error(f"Initialization error: {str(e)}")
             raise
 
     def _check_flickr_quota(self):
-        # Réinitialisation du compteur toutes les heures
+        # Reset counter every hour
         if (datetime.now() - self.last_flickr_reset).total_seconds() >= 3600:
             self.flickr_calls = 0
             self.last_flickr_reset = datetime.now()
         
         if self.flickr_calls >= self.FLICKR_CALLS_PER_HOUR:
-            raise APIQuotaExceeded("Limite d'appels Flickr atteinte. Attente nécessaire.")
+            raise APIQuotaExceeded("Flickr API call limit reached. Waiting necessary.")
         
         self.flickr_calls += 1
 
     def _check_google_quota(self):
-        # Réinitialisation du compteur tous les jours
+        # Reset counter every day
         if (datetime.now() - self.last_upload_reset).days >= 1:
             self.upload_count = 0
             self.last_upload_reset = datetime.now()
         
         if self.upload_count >= self.GOOGLE_PHOTOS_DAILY_UPLOADS:
-            raise APIQuotaExceeded("Limite quotidienne Google Photos atteinte.")
+            raise APIQuotaExceeded("Daily Google Photos upload limit reached.")
         
         self.upload_count += 1
 
@@ -102,14 +102,14 @@ class PhotoTransferer:
                            static_discovery=False)
             return service
         except Exception as e:
-            logging.error(f"Erreur d'authentification Google: {str(e)}")
+            logging.error(f"Google authentication error: {str(e)}")
             raise
     
     def get_flickr_albums(self):
         try:
             self._check_flickr_quota()
-            # D'abord, obtenir votre propre ID utilisateur
-            user = self.flickr.test.login()  # Cette méthode obtient les infos de l'utilisateur authentifié
+            # First, get your own user ID
+            user = self.flickr.test.login()  # This method gets authenticated user info
             user_id = user['user']['id']
             
             self._check_flickr_quota()
@@ -119,11 +119,11 @@ class PhotoTransferer:
             logging.warning(str(e))
             raise
         except Exception as e:
-            logging.error(f"Erreur lors de la récupération des albums: {str(e)}")
+            logging.error(f"Error during album retrieval: {str(e)}")
             raise
     
     def get_google_albums(self):
-        """Récupère tous les albums Google Photos existants"""
+        """Retrieves all existing Google Photos albums"""
         try:
             albums = []
             page_token = None
@@ -136,7 +136,7 @@ class PhotoTransferer:
                 
                 if 'albums' in response:
                     for album in response['albums']:
-                        # Vérifier que le titre existe
+                        # Check if title exists
                         if 'title' in album:
                             albums.append(album)
                 
@@ -146,11 +146,11 @@ class PhotoTransferer:
             
             return albums
         except Exception as e:
-            logging.error(f"Erreur lors de la récupération des albums Google: {str(e)}")
+            logging.error(f"Error during Google Photos album retrieval: {str(e)}")
             raise
 
     def get_album_photos(self, album_id):
-        """Récupère toutes les photos d'un album Google Photos"""
+        """Retrieves all photos from a Google Photos album"""
         try:
             photos = []
             page_token = None
@@ -166,9 +166,9 @@ class PhotoTransferer:
                 
                 if 'mediaItems' in response:
                     for item in response['mediaItems']:
-                        # Extraire uniquement le nom de base du fichier
+                        # Extract only the base filename
                         filename = os.path.splitext(item['filename'])[0]
-                        # Nettoyer le nom (enlever les caractères spéciaux et espaces)
+                        # Clean name (remove special characters and spaces)
                         clean_name = ''.join(e for e in filename if e.isalnum()).lower()
                         photos.append({
                             'id': item['id'],
@@ -182,12 +182,12 @@ class PhotoTransferer:
             
             return photos
         except Exception as e:
-            logging.error(f"Erreur lors de la récupération des photos: {str(e)}")
+            logging.error(f"Error during photo retrieval: {str(e)}")
             raise
 
     def transfer_album(self, flickr_album, google_albums=None):
         try:
-            # Vérifier si l'album existe déjà
+            # Check if album already exists
             if google_albums is None:
                 google_albums = self.get_google_albums()
                 
@@ -199,20 +199,20 @@ class PhotoTransferer:
             
             if existing_album:
                 google_album = existing_album
-                print(f"Album existant trouvé: {flickr_album['title']['_content']}")
-                # Récupérer les photos existantes
+                print(f"Existing album found: {flickr_album['title']['_content']}")
+                # Retrieve existing photos
                 existing_photos = self.get_album_photos(existing_album['id'])
-                print(f"Nombre de photos déjà dans l'album: {len(existing_photos)}")
+                print(f"Number of photos already in the album: {len(existing_photos)}")
             else:
-                # Créer un nouvel album
+                # Create a new album
                 album_body = {
                     'album': {'title': flickr_album['title']['_content']}
                 }
                 google_album = self.google_photos.albums().create(body=album_body).execute()
-                print(f"Nouvel album créé: {flickr_album['title']['_content']}")
+                print(f"New album created: {flickr_album['title']['_content']}")
                 existing_photos = []
             
-            # Obtenir les photos de l'album Flickr
+            # Retrieve photos from the Flickr album
             self._check_flickr_quota()
             photos = self.flickr.photosets.getPhotos(
                 photoset_id=flickr_album['id'],
@@ -220,40 +220,40 @@ class PhotoTransferer:
             )
             
             total_photos = len(photos['photoset']['photo'])
-            print(f"\nNombre total de photos dans l'album Flickr: {total_photos}")
+            print(f"\nTotal number of photos in the Flickr album: {total_photos}")
             
             transferred_photos = 0
             skipped_photos = 0
             failed_photos = 0
             
-            # Créer un set des noms nettoyés pour une recherche rapide
+            # Create a set of cleaned names for quick search
             existing_photo_names = {
                 photo['clean_name'] for photo in existing_photos
             }
             
-            print("\nDébut de l'analyse des photos...")
+            print("\nStarting photo analysis...")
             for i, photo in enumerate(photos['photoset']['photo'], 1):
                 try:
-                    # Obtenir les infos de la photo Flickr
+                    # Retrieve photo info from Flickr
                     photo_info = self.flickr.photos.getInfo(photo_id=photo['id'])
                     photo_title = photo_info['photo']['title']['_content']
                     
-                    # Nettoyer le nom de la photo de la même manière
+                    # Clean name of the photo in the same way
                     clean_name = ''.join(e for e in photo_title if e.isalnum()).lower()
                     
-                    # Vérifier si la photo existe déjà
+                    # Check if photo already exists
                     if clean_name in existing_photo_names:
-                        print(f"Photo {i}/{total_photos} : '{photo_title}' - déjà existante ✓")
+                        print(f"Photo {i}/{total_photos} : '{photo_title}' - already exists ✓")
                         skipped_photos += 1
                         continue
                     
-                    # Si la photo n'existe pas, procéder au transfert
+                    # If photo doesn't exist, proceed with transfer
                     sizes = self.flickr.photos.getSizes(photo_id=photo['id'])
                     available_sizes = sizes['sizes']['size']
                     available_sizes.sort(key=lambda x: int(x.get('width', 0)), reverse=True)
                     best_quality = available_sizes[0]
                     
-                    # Télécharger la photo
+                    # Download the photo
                     response = requests.get(
                         best_quality['source'],
                         timeout=30,
@@ -264,21 +264,21 @@ class PhotoTransferer:
                     )
                     response.raise_for_status()
                     
-                    # Uploader vers Google Photos
+                    # Upload to Google Photos
                     self._upload_to_google_photos(response.content, google_album['id'])
                     transferred_photos += 1
-                    print(f"Photo {i}/{total_photos} : '{photo_title}' - transférée avec succès ↑")
+                    print(f"Photo {i}/{total_photos} : '{photo_title}' - transferred successfully ↑")
                     
                 except Exception as e:
                     failed_photos += 1
-                    print(f"Photo {i}/{total_photos} : '{photo_title}' - échec du transfert ✗ ({str(e)})")
+                    print(f"Photo {i}/{total_photos} : '{photo_title}' - transfer failed ✗ ({str(e)})")
                     continue
             
-            print(f"\nRésumé pour l'album '{flickr_album['title']['_content']}':")
-            print(f"- Photos trouvées dans Flickr: {total_photos}")
-            print(f"- Photos déjà existantes: {skipped_photos}")
-            print(f"- Nouvelles photos transférées: {transferred_photos}")
-            print(f"- Échecs de transfert: {failed_photos}")
+            print(f"\nSummary for album '{flickr_album['title']['_content']}':")
+            print(f"- Photos found in Flickr: {total_photos}")
+            print(f"- Existing photos: {skipped_photos}")
+            print(f"- New photos transferred: {transferred_photos}")
+            print(f"- Transfer failures: {failed_photos}")
             
             return {
                 'album_name': flickr_album['title']['_content'],
@@ -292,17 +292,17 @@ class PhotoTransferer:
             logging.warning(str(e))
             raise
         except Exception as e:
-            logging.error(f"Erreur lors du transfert de l'album: {str(e)}")
+            logging.error(f"Error during album transfer: {str(e)}")
             raise
 
     def _upload_to_google_photos(self, photo_bytes, album_id):
         """
-        Télécharge une photo vers Google Photos et l'ajoute à l'album
+        Upload a photo to Google Photos and add it to the album
         """
         try:
             import requests
 
-            # 1. Upload de la photo
+            # 1. Upload the photo
             upload_url = 'https://photoslibrary.googleapis.com/v1/uploads'
             headers = {
                 'Authorization': f'Bearer {self.credentials.token}',
@@ -310,15 +310,15 @@ class PhotoTransferer:
                 'X-Goog-Upload-Protocol': 'raw'
             }
 
-            # Faire l'upload
+            # Perform the upload
             upload_response = requests.post(upload_url, data=photo_bytes, headers=headers)
             upload_response.raise_for_status()
             upload_token = upload_response.content.decode('utf-8')
 
             if not upload_token:
-                raise Exception("Échec de l'obtention du token d'upload")
+                raise Exception("Failed to obtain upload token")
 
-            # 2. Créer l'élément média
+            # 2. Create media item
             request_body = {
                 'newMediaItems': [{
                     'simpleMediaItem': {
@@ -327,22 +327,22 @@ class PhotoTransferer:
                 }]
             }
 
-            # 3. Créer l'élément dans Google Photos avec l'album ID
-            request_body['albumId'] = album_id  # Ajouter l'album ID directement dans la requête de création
+            # 3. Create item in Google Photos with album ID
+            request_body['albumId'] = album_id  # Add album ID directly to creation request
 
             response = self.google_photos.mediaItems().batchCreate(
                 body=request_body
             ).execute()
 
             if not response.get('newMediaItemResults'):
-                raise Exception("Échec de la création de l'élément média")
+                raise Exception("Failed to create media item")
 
             status = response['newMediaItemResults'][0]['status']
             if status.get('message') != 'Success':
-                raise Exception(f"Erreur lors de l'upload: {status.get('message')}")
+                raise Exception(f"Upload error: {status.get('message')}")
 
             return True
 
         except Exception as e:
-            logging.error(f"Erreur lors de l'upload vers Google Photos: {str(e)}")
+            logging.error(f"Error during upload to Google Photos: {str(e)}")
             raise
