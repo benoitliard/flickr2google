@@ -58,9 +58,11 @@ With tons of storage already available on Google (thanks, Google One!), it made 
 
 ### Installation
 
-1. Clone this repository:   ```bash
-   git clone https://github.com/your-username/flickr-to-google-photos.git
-   cd flickr-to-google-photos   ```
+1. Clone this repository:
+   ```bash
+   git clone git@github.com:benoitliard/flickr2google.git
+   cd flickr2google
+   ```
 
 2. Create and activate a virtual environment:   ```bash
    # On Windows
@@ -107,15 +109,6 @@ For each transferred album, you'll see:
 - Keep your API keys and client secrets secure and never commit them to version control
 - Transfer duration depends on photo count and size
 - For Google Photos API, you'll remain in "Testing" status unless you verify your app, which limits to 100 users
-
-## 🤝 Contributing
-
-Contributions are welcome! Feel free to:
-1. Fork the project
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
 
 ## 📝 License
 
