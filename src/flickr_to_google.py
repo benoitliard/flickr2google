@@ -194,6 +194,10 @@ class PhotoTransferer:
             album_name = flickr_album['title']['_content']
             logging.info(f"Starting transfer of album: {album_name}")
             
+            # Get Flickr album photo count
+            flickr_photo_count = int(flickr_album['photos'])
+            logging.info(f"Flickr album '{album_name}' contains {flickr_photo_count} items")
+            
             # Check if album already exists
             if google_albums is None:
                 google_albums = self.get_google_albums()
@@ -205,10 +209,28 @@ class PhotoTransferer:
             )
             
             if existing_album:
+                # Get Google Photos album media count
+                existing_photos = self.get_album_photos(existing_album['id'])
+                google_photo_count = len(existing_photos)
+                logging.info(f"Google Photos album '{album_name}' contains {google_photo_count} items")
+                
+                # Check if counts match
+                if flickr_photo_count == google_photo_count:
+                    message = f"Album '{album_name}' already fully transferred (both have {flickr_photo_count} items) - skipping"
+                    print(message)
+                    logging.info(message)
+                    return {
+                        'album_name': album_name,
+                        'total': flickr_photo_count,
+                        'transferred': 0,
+                        'skipped': flickr_photo_count,
+                        'failed': 0,
+                        'status': 'skipped_complete'
+                    }
+                
                 google_album = existing_album
                 logging.info(f"Found existing album: {album_name} (ID: {existing_album['id']})")
-                existing_photos = self.get_album_photos(existing_album['id'])
-                logging.info(f"Number of photos already in album: {len(existing_photos)}")
+                logging.info(f"Will check for missing items ({flickr_photo_count - google_photo_count} items difference)")
             else:
                 # Create a new album
                 album_body = {
@@ -240,66 +262,88 @@ class PhotoTransferer:
             print("\nStarting photo analysis...")
             logging.info(f"Starting photo analysis for album: {album_name}")
             
+            MAX_RETRIES = 3
+            
             for i, photo in enumerate(photos['photoset']['photo'], 1):
-                try:
-                    photo_info = self.flickr.photos.getInfo(photo_id=photo['id'])
-                    photo_title = photo_info['photo']['title']['_content']
-                    
-                    # Check if it's a video
-                    is_video = photo_info['photo'].get('media') == 'video'
-                    logging.info(f"Processing {'video' if is_video else 'photo'} {i}/{total_photos}: {photo_title}")
-                    
-                    clean_name = ''.join(e for e in photo_title if e.isalnum()).lower()
-                    
-                    if clean_name in existing_photo_names:
-                        print(f"Media {i}/{total_photos}: '{photo_title}' - already exists ✓")
-                        logging.info(f"Media {i}/{total_photos}: '{photo_title}' - skipped (already exists)")
-                        skipped_photos += 1
-                        continue
-                    
-                    # Get media sizes/formats
-                    if is_video:
-                        video_info = self.flickr.photos.getSizes(photo_id=photo['id'])
-                        available_formats = video_info['sizes']['size']
-                        available_formats.sort(key=lambda x: int(x.get('width', 0) or 0), reverse=True)
-                        best_quality = next((fmt for fmt in available_formats if fmt.get('media') == 'video'), None)
+                retry_count = 0
+                transfer_success = False
+                last_error = None
+                
+                while retry_count < MAX_RETRIES and not transfer_success:
+                    try:
+                        if retry_count > 0:
+                            retry_message = f"Retry attempt {retry_count}/{MAX_RETRIES} for '{photo_title}'"
+                            print(retry_message)
+                            logging.info(retry_message)
+                            time.sleep(2 * retry_count)  # Exponential backoff
                         
-                        if not best_quality:
-                            raise Exception("No video format available")
+                        photo_info = self.flickr.photos.getInfo(photo_id=photo['id'])
+                        photo_title = photo_info['photo']['title']['_content']
+                        
+                        # Check if it's a video
+                        is_video = photo_info['photo'].get('media') == 'video'
+                        logging.info(f"Processing {'video' if is_video else 'photo'} {i}/{total_photos}: {photo_title}")
+                        
+                        clean_name = ''.join(e for e in photo_title if e.isalnum()).lower()
+                        
+                        if clean_name in existing_photo_names:
+                            print(f"Media {i}/{total_photos}: '{photo_title}' - already exists ✓")
+                            logging.info(f"Media {i}/{total_photos}: '{photo_title}' - skipped (already exists)")
+                            skipped_photos += 1
+                            transfer_success = True
+                            break
+                        
+                        # Get media sizes/formats
+                        if is_video:
+                            video_info = self.flickr.photos.getSizes(photo_id=photo['id'])
+                            available_formats = video_info['sizes']['size']
+                            available_formats.sort(key=lambda x: int(x.get('width', 0) or 0), reverse=True)
+                            best_quality = next((fmt for fmt in available_formats if fmt.get('media') == 'video'), None)
                             
-                        media_url = best_quality['source']
-                        logging.info(f"Downloading video: {media_url}")
-                    else:
-                        sizes = self.flickr.photos.getSizes(photo_id=photo['id'])
-                        available_sizes = sizes['sizes']['size']
-                        available_sizes.sort(key=lambda x: int(x.get('width', 0)), reverse=True)
-                        best_quality = available_sizes[0]
-                        media_url = best_quality['source']
-                        logging.info(f"Downloading photo: {media_url}")
-                    
-                    # Download media
-                    response = requests.get(
-                        media_url,
-                        timeout=120,  # Increased timeout for videos
-                        headers={
-                            'User-Agent': 'FlickrToGooglePhotos/1.0',
-                            'Referer': 'https://www.flickr.com/'
-                        },
-                        stream=True  # Stream for large files
-                    )
-                    response.raise_for_status()
-                    
-                    # Upload to Google Photos
-                    self._upload_to_google_photos(response.content, google_album['id'])
-                    transferred_photos += 1
-                    print(f"Media {i}/{total_photos}: '{photo_title}' - transferred successfully ↑")
-                    logging.info(f"Successfully transferred {'video' if is_video else 'photo'} {i}/{total_photos}: {photo_title}")
-                    
-                except Exception as e:
-                    failed_photos += 1
-                    error_message = f"Media {i}/{total_photos}: '{photo_title}' - transfer failed ✗ ({str(e)})"
-                    print(error_message)
-                    logging.error(error_message)
+                            if not best_quality:
+                                raise Exception("No video format available")
+                                
+                            media_url = best_quality['source']
+                            logging.info(f"Downloading video: {media_url}")
+                        else:
+                            sizes = self.flickr.photos.getSizes(photo_id=photo['id'])
+                            available_sizes = sizes['sizes']['size']
+                            available_sizes.sort(key=lambda x: int(x.get('width', 0)), reverse=True)
+                            best_quality = available_sizes[0]
+                            media_url = best_quality['source']
+                            logging.info(f"Downloading photo: {media_url}")
+                        
+                        # Download media
+                        response = requests.get(
+                            media_url,
+                            timeout=120,  # Increased timeout for videos
+                            headers={
+                                'User-Agent': 'FlickrToGooglePhotos/1.0',
+                                'Referer': 'https://www.flickr.com/'
+                            },
+                            stream=True  # Stream for large files
+                        )
+                        response.raise_for_status()
+                        
+                        # Upload to Google Photos
+                        self._upload_to_google_photos(response.content, google_album['id'])
+                        transferred_photos += 1
+                        print(f"Media {i}/{total_photos}: '{photo_title}' - transferred successfully ↑")
+                        logging.info(f"Successfully transferred {'video' if is_video else 'photo'} {i}/{total_photos}: {photo_title}")
+                        transfer_success = True
+                        
+                    except Exception as e:
+                        last_error = str(e)
+                        retry_count += 1
+                        if retry_count < MAX_RETRIES:
+                            logging.warning(f"Transfer attempt {retry_count} failed for '{photo_title}': {last_error}")
+                        else:
+                            failed_photos += 1
+                            error_message = f"Media {i}/{total_photos}: '{photo_title}' - transfer failed after {MAX_RETRIES} attempts ✗ ({last_error})"
+                            print(error_message)
+                            logging.error(error_message)
+                
+                if not transfer_success and retry_count >= MAX_RETRIES:
                     continue
             
             summary_message = (
