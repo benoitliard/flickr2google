@@ -11,6 +11,7 @@ With tons of storage already available on Google (thanks, Google One!), it made 
 ## ✨ Features
 
 - 📸 Transfers complete albums with original quality
+- 🔄 Supports both photos and videos transfer
 - 🔄 Smart duplicate detection (no more double uploads!)
 - 📁 Preserves album structure
 - 🎯 Choose between single album or bulk transfer
@@ -96,9 +97,9 @@ With tons of storage already available on Google (thanks, Google One!), it made 
 ## 📊 Transfer Results
 
 For each transferred album, you'll see:
-- Total photos found
-- Already existing photos (skipped)
-- Newly transferred photos
+- Total media items found (photos and videos)
+- Already existing items (skipped)
+- Newly transferred items
 - Failed transfers
 
 ## ⚠️ Important Notes
@@ -107,8 +108,10 @@ For each transferred album, you'll see:
 - The Google Photos API has a quota of 10,000 requests per day
 - Flickr API has rate limits of 3,600 queries per hour
 - Keep your API keys and client secrets secure and never commit them to version control
-- Transfer duration depends on photo count and size
+- Transfer duration depends on media count and size (videos may take longer)
 - For Google Photos API, you'll remain in "Testing" status unless you verify your app, which limits to 100 users
+- Video transfers might take longer due to file sizes
+- Supports original quality for both photos and videos
 
 ## 📝 License
 

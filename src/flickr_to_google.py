@@ -12,6 +12,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Add this at the start of your script
+print("FLICKR_API_KEY:", os.getenv('FLICKR_API_KEY'))
+print("FLICKR_API_SECRET:", os.getenv('FLICKR_API_SECRET'))
+
 class APIQuotaExceeded(Exception):
     pass
 
@@ -187,29 +191,31 @@ class PhotoTransferer:
 
     def transfer_album(self, flickr_album, google_albums=None):
         try:
+            album_name = flickr_album['title']['_content']
+            logging.info(f"Starting transfer of album: {album_name}")
+            
             # Check if album already exists
             if google_albums is None:
                 google_albums = self.get_google_albums()
                 
             existing_album = next(
                 (album for album in google_albums 
-                 if album['title'] == flickr_album['title']['_content']),
+                 if album['title'] == album_name),
                 None
             )
             
             if existing_album:
                 google_album = existing_album
-                print(f"Existing album found: {flickr_album['title']['_content']}")
-                # Retrieve existing photos
+                logging.info(f"Found existing album: {album_name} (ID: {existing_album['id']})")
                 existing_photos = self.get_album_photos(existing_album['id'])
-                print(f"Number of photos already in the album: {len(existing_photos)}")
+                logging.info(f"Number of photos already in album: {len(existing_photos)}")
             else:
                 # Create a new album
                 album_body = {
-                    'album': {'title': flickr_album['title']['_content']}
+                    'album': {'title': album_name}
                 }
                 google_album = self.google_photos.albums().create(body=album_body).execute()
-                print(f"New album created: {flickr_album['title']['_content']}")
+                logging.info(f"Created new album: {album_name} (ID: {google_album['id']})")
                 existing_photos = []
             
             # Retrieve photos from the Flickr album
@@ -232,53 +238,83 @@ class PhotoTransferer:
             }
             
             print("\nStarting photo analysis...")
+            logging.info(f"Starting photo analysis for album: {album_name}")
+            
             for i, photo in enumerate(photos['photoset']['photo'], 1):
                 try:
-                    # Retrieve photo info from Flickr
                     photo_info = self.flickr.photos.getInfo(photo_id=photo['id'])
                     photo_title = photo_info['photo']['title']['_content']
                     
-                    # Clean name of the photo in the same way
+                    # Check if it's a video
+                    is_video = photo_info['photo'].get('media') == 'video'
+                    logging.info(f"Processing {'video' if is_video else 'photo'} {i}/{total_photos}: {photo_title}")
+                    
                     clean_name = ''.join(e for e in photo_title if e.isalnum()).lower()
                     
-                    # Check if photo already exists
                     if clean_name in existing_photo_names:
-                        print(f"Photo {i}/{total_photos} : '{photo_title}' - already exists ✓")
+                        print(f"Media {i}/{total_photos}: '{photo_title}' - already exists ✓")
+                        logging.info(f"Media {i}/{total_photos}: '{photo_title}' - skipped (already exists)")
                         skipped_photos += 1
                         continue
                     
-                    # If photo doesn't exist, proceed with transfer
-                    sizes = self.flickr.photos.getSizes(photo_id=photo['id'])
-                    available_sizes = sizes['sizes']['size']
-                    available_sizes.sort(key=lambda x: int(x.get('width', 0)), reverse=True)
-                    best_quality = available_sizes[0]
+                    # Get media sizes/formats
+                    if is_video:
+                        video_info = self.flickr.photos.getSizes(photo_id=photo['id'])
+                        available_formats = video_info['sizes']['size']
+                        available_formats.sort(key=lambda x: int(x.get('width', 0) or 0), reverse=True)
+                        best_quality = next((fmt for fmt in available_formats if fmt.get('media') == 'video'), None)
+                        
+                        if not best_quality:
+                            raise Exception("No video format available")
+                            
+                        media_url = best_quality['source']
+                        logging.info(f"Downloading video: {media_url}")
+                    else:
+                        sizes = self.flickr.photos.getSizes(photo_id=photo['id'])
+                        available_sizes = sizes['sizes']['size']
+                        available_sizes.sort(key=lambda x: int(x.get('width', 0)), reverse=True)
+                        best_quality = available_sizes[0]
+                        media_url = best_quality['source']
+                        logging.info(f"Downloading photo: {media_url}")
                     
-                    # Download the photo
+                    # Download media
                     response = requests.get(
-                        best_quality['source'],
-                        timeout=30,
+                        media_url,
+                        timeout=120,  # Increased timeout for videos
                         headers={
                             'User-Agent': 'FlickrToGooglePhotos/1.0',
                             'Referer': 'https://www.flickr.com/'
-                        }
+                        },
+                        stream=True  # Stream for large files
                     )
                     response.raise_for_status()
                     
                     # Upload to Google Photos
                     self._upload_to_google_photos(response.content, google_album['id'])
                     transferred_photos += 1
-                    print(f"Photo {i}/{total_photos} : '{photo_title}' - transferred successfully ↑")
+                    print(f"Media {i}/{total_photos}: '{photo_title}' - transferred successfully ↑")
+                    logging.info(f"Successfully transferred {'video' if is_video else 'photo'} {i}/{total_photos}: {photo_title}")
                     
                 except Exception as e:
                     failed_photos += 1
-                    print(f"Photo {i}/{total_photos} : '{photo_title}' - transfer failed ✗ ({str(e)})")
+                    error_message = f"Media {i}/{total_photos}: '{photo_title}' - transfer failed ✗ ({str(e)})"
+                    print(error_message)
+                    logging.error(error_message)
                     continue
             
-            print(f"\nSummary for album '{flickr_album['title']['_content']}':")
-            print(f"- Photos found in Flickr: {total_photos}")
-            print(f"- Existing photos: {skipped_photos}")
-            print(f"- New photos transferred: {transferred_photos}")
-            print(f"- Transfer failures: {failed_photos}")
+            summary_message = (
+                f"\nTransfer summary for album '{album_name}':\n"
+                f"- Total media items found: {total_photos}\n"
+                f"- Already existing: {skipped_photos}\n"
+                f"- Successfully transferred: {transferred_photos}\n"
+                f"- Failed transfers: {failed_photos}"
+            )
+            print(summary_message)
+            logging.info(summary_message)
+            
+            logging.info(f"Album transfer complete: {album_name}")
+            logging.info(f"Summary - Total: {total_photos}, Transferred: {transferred_photos}, "
+                        f"Skipped: {skipped_photos}, Failed: {failed_photos}")
             
             return {
                 'album_name': flickr_album['title']['_content'],
@@ -300,8 +336,8 @@ class PhotoTransferer:
         Upload a photo to Google Photos and add it to the album
         """
         try:
-            import requests
-
+            logging.info(f"Starting photo upload to album ID: {album_id}")
+            
             # 1. Upload the photo
             upload_url = 'https://photoslibrary.googleapis.com/v1/uploads'
             headers = {
@@ -310,13 +346,10 @@ class PhotoTransferer:
                 'X-Goog-Upload-Protocol': 'raw'
             }
 
-            # Perform the upload
             upload_response = requests.post(upload_url, data=photo_bytes, headers=headers)
             upload_response.raise_for_status()
             upload_token = upload_response.content.decode('utf-8')
-
-            if not upload_token:
-                raise Exception("Failed to obtain upload token")
+            logging.info("Upload token obtained successfully")
 
             # 2. Create media item
             request_body = {
@@ -338,11 +371,14 @@ class PhotoTransferer:
                 raise Exception("Failed to create media item")
 
             status = response['newMediaItemResults'][0]['status']
-            if status.get('message') != 'Success':
+            if status.get('message') == 'Success':
+                logging.info(f"Photo successfully added to album ID: {album_id}")
+            else:
+                logging.error(f"Failed to add photo to album: {status.get('message')}")
                 raise Exception(f"Upload error: {status.get('message')}")
 
             return True
 
         except Exception as e:
-            logging.error(f"Error during upload to Google Photos: {str(e)}")
+            logging.error(f"Error uploading to Google Photos: {str(e)}")
             raise
