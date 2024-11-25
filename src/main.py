@@ -5,73 +5,54 @@ def main():
     try:
         transferer = PhotoTransferer()
         
-        print("Retrieving Flickr albums...")
-        albums = transferer.get_flickr_albums()
-        
-        print(f"\nNumber of albums found: {len(albums)}")
-        print("\nAvailable options:")
-        print("1. Transfer a specific album")
-        print("2. Transfer all albums")
-        print("q. Quit")
-        
         while True:
-            choice = input("\nSelect an option: ")
+            print("\nOptions:")
+            print("1. Transfer a specific album")
+            print("2. Transfer all albums")
+            print("q. Quit")
             
-            if choice.lower() == 'q':
+            choice = input("\nSelect an option: ").strip().lower()
+            
+            if choice == 'q':
                 break
                 
-            elif choice == '1':
-                # Display album list
-                print("\nAlbum list:")
+            if choice == '1':
+                # Get list of albums
+                albums = transferer.get_flickr_albums()
+                
+                print("\nAvailable albums:")
                 for i, album in enumerate(albums, 1):
                     print(f"{i}. {album['title']['_content']} ({album['photos']} photos)")
                 
-                while True:
-                    album_choice = input("\nEnter album number to transfer (or 'r' to return): ")
-                    if album_choice.lower() == 'r':
-                        break
-                    
+                album_choice = int(input("\nSelect album number: ")) - 1
+                if 0 <= album_choice < len(albums):
+                    selected_album = albums[album_choice]
+                    print(f"\nProcessing album: {selected_album['title']['_content']}")
                     try:
-                        index = int(album_choice) - 1
-                        if 0 <= index < len(albums):
-                            album = albums[index]
-                            print(f"\nTransferring album: {album['title']['_content']}")
-                            result = transferer.transfer_album(album)
-                            print(f"\nTransfer results:")
-                            print(f"- Photos found: {result['total']}")
-                            print(f"- Already existing: {result['skipped']}")
-                            print(f"- Newly transferred: {result['transferred']}")
-                            print(f"- Transfer failed: {result['failed']}")
-                        else:
-                            print("Invalid album number")
-                    except ValueError:
-                        print("Please enter a valid number")
+                        result = transferer._transfer_single_album(selected_album)
+                        print(f"Transfer completed: {result}")
                     except Exception as e:
-                        print(f"Transfer error: {str(e)}")
-                        
+                        print(f"Error transferring album {selected_album['title']['_content']}: {str(e)}")
+                else:
+                    print("Invalid album selection")
+                    
             elif choice == '2':
                 print("\nStarting transfer of all albums...")
-                google_albums = transferer.get_google_albums()  # Get once
+                albums = transferer.get_flickr_albums()
                 
                 for album in albums:
+                    print(f"\nProcessing album: {album['title']['_content']}")
                     try:
-                        print(f"\nProcessing album: {album['title']['_content']}")
-                        result = transferer.transfer_album(album, google_albums)
-                        print(f"\nTransfer results:")
-                        print(f"- Photos found: {result['total']}")
-                        print(f"- Already existing: {result['skipped']}")
-                        print(f"- Newly transferred: {result['transferred']}")
-                        print(f"- Transfer failed: {result['failed']}")
+                        result = transferer._transfer_single_album(album)
+                        print(f"Transfer completed: {result}")
                     except Exception as e:
                         print(f"Error transferring album {album['title']['_content']}: {str(e)}")
-                        
-                print("\nComplete transfer finished")
             
             else:
                 print("Invalid option")
                 
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Main error: {str(e)}")
         logging.error(f"Main error: {str(e)}")
 
 if __name__ == "__main__":

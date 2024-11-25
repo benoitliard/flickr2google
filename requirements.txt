@@ -4,4 +4,7 @@ google-auth-httplib2==0.1.0
 google-api-python-client==2.86.0
 requests==2.31.0
 python-dotenv==1.0.0
-oauth2client==3.0.0 
+oauth2client==3.0.0
+psutil==5.9.6 
+numpy==1.26.4
+google-auth==2.23.4

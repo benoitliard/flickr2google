@@ -3,12 +3,26 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from oauth2client.file import Storage
 import os
 import requests
 import time
 from datetime import datetime
 import logging
 from dotenv import load_dotenv
+import concurrent.futures  # Add for parallel processing
+import numpy as np  # Add for faster array operations
+import urllib3
+import warnings
+import threading
+from google.auth.transport.requests import Request
+import httplib2  # Add this import instead of build_http
+from oauth2client.client import OAuth2Credentials
+import google_auth_httplib2
+import json
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 load_dotenv()
 
@@ -71,6 +85,37 @@ class PhotoTransferer:
         except Exception as e:
             logging.error(f"Initialization error: {str(e)}")
             raise
+        
+        # Configure session with adjusted pool settings
+        self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=100,  # Increased from 50
+            pool_maxsize=100,     # Increased from 50
+            max_retries=3,
+            pool_block=False
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        
+        # Adjust concurrency settings for better performance
+        self.BATCH_SIZE = 2      # Réduit de 5 à 2
+        self.MAX_WORKERS = 2     # Réduit de 5 à 2
+        self.UPLOAD_TIMEOUT = 180
+        self.DOWNLOAD_TIMEOUT = 180
+        
+        # Increase semaphore limit for more concurrent uploads
+        self.upload_semaphore = threading.Semaphore(2)  # Réduit de 5 à 2
+        
+        # Add event for graceful shutdown
+        self.shutdown_event = threading.Event()
+        
+        # Cache for album data
+        self._album_cache = {}
+        self._photo_cache = {}
+        
+        # Ajouter un délai entre les requêtes
+        self.WRITE_REQUESTS_PER_MINUTE = 30  # Limite Google
+        self.write_request_delay = 60 / self.WRITE_REQUESTS_PER_MINUTE  # ~2 secondes entre chaque requête
 
     def _check_flickr_quota(self):
         # Reset counter every hour
@@ -96,15 +141,38 @@ class PhotoTransferer:
 
     def _authenticate_google(self):
         try:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                'client_secrets.json',
-                self.SCOPES
-            )
-            self.credentials = flow.run_local_server(port=0)
+            creds = None
+            # The file token.json stores the user's access and refresh tokens
+            if os.path.exists('token.json'):
+                creds = Credentials.from_authorized_user_file('token.json', self.SCOPES)
+
+            # If there are no (valid) credentials available, let the user log in.
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    flow = InstalledAppFlow.from_client_secrets_file(
+                        'client_secrets.json',
+                        scopes=self.SCOPES
+                    )
+                    creds = flow.run_local_server(port=0)
+                    
+                    # Save the credentials
+                    with open('token.json', 'w') as token:
+                        token.write(creds.to_json())
+                    logging.info("New credentials stored successfully")
+
+            self.credentials = creds
+            
+            # Create authorized HTTP object
+            authorized_http = google_auth_httplib2.AuthorizedHttp(
+                creds, http=httplib2.Http())
+
             service = build('photoslibrary', 'v1', 
-                           credentials=self.credentials,
-                           static_discovery=False)
+                          http=authorized_http,
+                          static_discovery=False)
             return service
+            
         except Exception as e:
             logging.error(f"Google authentication error: {str(e)}")
             raise
@@ -127,7 +195,11 @@ class PhotoTransferer:
             raise
     
     def get_google_albums(self):
-        """Retrieves all existing Google Photos albums"""
+        """Retrieves all existing Google Photos albums with caching"""
+        cache_key = 'google_albums'
+        if cache_key in self._album_cache:
+            return self._album_cache[cache_key]
+            
         try:
             albums = []
             page_token = None
@@ -148,55 +220,102 @@ class PhotoTransferer:
                 if not page_token:
                     break
             
+            self._album_cache[cache_key] = albums
             return albums
         except Exception as e:
             logging.error(f"Error during Google Photos album retrieval: {str(e)}")
             raise
 
+    def _normalize_filename(self, filename):
+        """Normalize filename for consistent comparison"""
+        # Remove file extension
+        name = os.path.splitext(filename)[0]
+        # Convert to lowercase
+        name = name.lower()
+        # Replace special characters with underscore
+        name = ''.join(c if c.isalnum() else '_' for c in name)
+        # Remove multiple consecutive underscores
+        name = '_'.join(filter(None, name.split('_')))
+        return name
+
     def get_album_photos(self, album_id):
-        """Retrieves all photos from a Google Photos album"""
+        """Retrieves all photos from a Google Photos album with proper pagination"""
         try:
             photos = []
             page_token = None
+            page_size = 100
             
             while True:
+                logging.info(f"Fetching page of photos for album {album_id} (current count: {len(photos)})")
+                
                 response = self.google_photos.mediaItems().search(
                     body={
                         'albumId': album_id,
-                        'pageSize': 100,
+                        'pageSize': page_size,
                         'pageToken': page_token
                     }
                 ).execute()
                 
                 if 'mediaItems' in response:
                     for item in response['mediaItems']:
-                        # Extract only the base filename
-                        filename = os.path.splitext(item['filename'])[0]
-                        # Clean name (remove special characters and spaces)
-                        clean_name = ''.join(e for e in filename if e.isalnum()).lower()
+                        # Stocker plus d'informations pour une meilleure comparaison
                         photos.append({
                             'id': item['id'],
-                            'clean_name': clean_name,
-                            'original_name': item['filename']
+                            'clean_name': self._normalize_filename(item['filename']),
+                            'original_name': item['filename'],
+                            'google_id': item['id'],
+                            'creation_time': item.get('mediaMetadata', {}).get('creationTime'),
+                            'width': item.get('mediaMetadata', {}).get('width'),
+                            'height': item.get('mediaMetadata', {}).get('height'),
+                            'mime_type': item.get('mimeType')
                         })
+                    
+                    logging.info(f"Retrieved {len(response['mediaItems'])} items in this page")
+                    # Log détaillé des fichiers existants
+                    for item in photos[-len(response['mediaItems']):]:
+                        logging.info(f"Found existing file: {item['original_name']} (ID: {item['google_id']})")
                 
                 page_token = response.get('nextPageToken')
                 if not page_token:
                     break
             
             return photos
+            
         except Exception as e:
             logging.error(f"Error during photo retrieval: {str(e)}")
             raise
 
-    def transfer_album(self, flickr_album, google_albums=None):
+    def _get_all_flickr_photos(self, photoset_id):
+        """Récupère toutes les photos d'un album Flickr avec pagination"""
+        all_photos = []
+        page = 1
+        per_page = 500
+        
+        while True:
+            photos = self.flickr.photosets.getPhotos(
+                photoset_id=photoset_id,
+                extras='url_o,original_format',
+                page=page,
+                per_page=per_page
+            )
+            
+            if 'photoset' not in photos or 'photo' not in photos['photoset']:
+                break
+                
+            all_photos.extend(photos['photoset']['photo'])
+            
+            if len(photos['photoset']['photo']) < per_page:
+                break
+                
+            page += 1
+            
+        return all_photos
+
+    def _transfer_single_album(self, flickr_album, google_albums=None):
+        """Handle transfer of albums under the Google Photos limit"""
+        executor = None
         try:
             album_name = flickr_album['title']['_content']
-            logging.info(f"Starting transfer of album: {album_name}")
-            
-            # Get Flickr album photo count
-            flickr_photo_count = int(flickr_album['photos'])
-            logging.info(f"Flickr album '{album_name}' contains {flickr_photo_count} items")
             
             # Check if album already exists
             if google_albums is None:
@@ -209,142 +328,121 @@ class PhotoTransferer:
             )
             
             if existing_album:
-                # Get Google Photos album media count
+                google_album = existing_album
                 existing_photos = self.get_album_photos(existing_album['id'])
                 google_photo_count = len(existing_photos)
                 logging.info(f"Google Photos album '{album_name}' contains {google_photo_count} items")
-                
-                # Check if counts match
-                if flickr_photo_count == google_photo_count:
-                    message = f"Album '{album_name}' already fully transferred (both have {flickr_photo_count} items) - skipping"
-                    print(message)
-                    logging.info(message)
-                    return {
-                        'album_name': album_name,
-                        'total': flickr_photo_count,
-                        'transferred': 0,
-                        'skipped': flickr_photo_count,
-                        'failed': 0,
-                        'status': 'skipped_complete'
-                    }
-                
-                google_album = existing_album
-                logging.info(f"Found existing album: {album_name} (ID: {existing_album['id']})")
-                logging.info(f"Will check for missing items ({flickr_photo_count - google_photo_count} items difference)")
+                print(f"Google Photos album contains {google_photo_count} items")
+                print(f"Difference: {int(flickr_album['photos']) - google_photo_count} items to transfer")
             else:
-                # Create a new album
                 album_body = {
                     'album': {'title': album_name}
                 }
                 google_album = self.google_photos.albums().create(body=album_body).execute()
-                logging.info(f"Created new album: {album_name} (ID: {google_album['id']})")
+                logging.info(f"Created new album: {album_name}")
                 existing_photos = []
+                google_photo_count = 0
             
-            # Retrieve photos from the Flickr album
-            self._check_flickr_quota()
-            photos = self.flickr.photosets.getPhotos(
-                photoset_id=flickr_album['id'],
-                extras='url_o,original_format'
-            )
-            
-            total_photos = len(photos['photoset']['photo'])
+            # Get Flickr photos with pagination
+            photos = self._get_all_flickr_photos(flickr_album['id'])
+            total_photos = len(photos)
             print(f"\nTotal number of photos in the Flickr album: {total_photos}")
             
             transferred_photos = 0
             skipped_photos = 0
             failed_photos = 0
+            processed_photos = 0  # Nouveau compteur pour le total traité
             
-            # Create a set of cleaned names for quick search
-            existing_photo_names = {
-                photo['clean_name'] for photo in existing_photos
-            }
+            # Create set of existing photo names for quick lookup
+            existing_photo_names = {photo['clean_name'] for photo in existing_photos}
             
             print("\nStarting photo analysis...")
             logging.info(f"Starting photo analysis for album: {album_name}")
             
-            MAX_RETRIES = 3
+            # Process in batches
+            batch_size = self.BATCH_SIZE
+            photo_batches = [
+                photos[i:i + batch_size]
+                for i in range(0, total_photos, batch_size)
+            ]
             
-            for i, photo in enumerate(photos['photoset']['photo'], 1):
-                retry_count = 0
-                transfer_success = False
-                last_error = None
+            # Process batches in parallel with proper cleanup
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.MAX_WORKERS)
+            futures = []
+            
+            try:
+                # Submit all batches to the executor
+                for batch in photo_batches:
+                    if self.shutdown_event.is_set():
+                        logging.info("Graceful shutdown requested")
+                        break
+                    future = executor.submit(self._process_photo_batch, batch, google_album['id'], existing_photos)
+                    futures.append(future)
                 
-                while retry_count < MAX_RETRIES and not transfer_success:
+                # Process results with longer timeout and better error handling
+                completed_futures = []
+                for future in concurrent.futures.as_completed(futures):
                     try:
-                        if retry_count > 0:
-                            retry_message = f"Retry attempt {retry_count}/{MAX_RETRIES} for '{photo_title}'"
-                            print(retry_message)
-                            logging.info(retry_message)
-                            time.sleep(2 * retry_count)  # Exponential backoff
+                        batch_results = future.result(timeout=300)
+                        completed_futures.append(future)
                         
-                        photo_info = self.flickr.photos.getInfo(photo_id=photo['id'])
-                        photo_title = photo_info['photo']['title']['_content']
-                        
-                        # Check if it's a video
-                        is_video = photo_info['photo'].get('media') == 'video'
-                        logging.info(f"Processing {'video' if is_video else 'photo'} {i}/{total_photos}: {photo_title}")
-                        
-                        clean_name = ''.join(e for e in photo_title if e.isalnum()).lower()
-                        
-                        if clean_name in existing_photo_names:
-                            print(f"Media {i}/{total_photos}: '{photo_title}' - already exists ✓")
-                            logging.info(f"Media {i}/{total_photos}: '{photo_title}' - skipped (already exists)")
-                            skipped_photos += 1
-                            transfer_success = True
-                            break
-                        
-                        # Get media sizes/formats
-                        if is_video:
-                            video_info = self.flickr.photos.getSizes(photo_id=photo['id'])
-                            available_formats = video_info['sizes']['size']
-                            available_formats.sort(key=lambda x: int(x.get('width', 0) or 0), reverse=True)
-                            best_quality = next((fmt for fmt in available_formats if fmt.get('media') == 'video'), None)
+                        for result in batch_results:
+                            processed_photos += 1  # Incrémenter pour chaque photo traitée
+                            if result['status'] == 'transferred':
+                                transferred_photos += 1
+                            elif result['status'] == 'skipped':
+                                skipped_photos += 1
+                            else:
+                                failed_photos += 1
                             
-                            if not best_quality:
-                                raise Exception("No video format available")
-                                
-                            media_url = best_quality['source']
-                            logging.info(f"Downloading video: {media_url}")
-                        else:
-                            sizes = self.flickr.photos.getSizes(photo_id=photo['id'])
-                            available_sizes = sizes['sizes']['size']
-                            available_sizes.sort(key=lambda x: int(x.get('width', 0)), reverse=True)
-                            best_quality = available_sizes[0]
-                            media_url = best_quality['source']
-                            logging.info(f"Downloading photo: {media_url}")
-                        
-                        # Download media
-                        response = requests.get(
-                            media_url,
-                            timeout=120,  # Increased timeout for videos
-                            headers={
-                                'User-Agent': 'FlickrToGooglePhotos/1.0',
-                                'Referer': 'https://www.flickr.com/'
-                            },
-                            stream=True  # Stream for large files
-                        )
-                        response.raise_for_status()
-                        
-                        # Upload to Google Photos
-                        self._upload_to_google_photos(response.content, google_album['id'])
-                        transferred_photos += 1
-                        print(f"Media {i}/{total_photos}: '{photo_title}' - transferred successfully ↑")
-                        logging.info(f"Successfully transferred {'video' if is_video else 'photo'} {i}/{total_photos}: {photo_title}")
-                        transfer_success = True
-                        
+                            # Afficher la progression incluant les skipped
+                            print(f"Progress: {processed_photos}/{total_photos} processed ({transferred_photos} transferred, {skipped_photos} skipped, {failed_photos} failed)")
+                            
+                    except concurrent.futures.TimeoutError:
+                        logging.error(f"Batch processing timeout after 5 minutes")
+                        batch_index = futures.index(future)
+                        failed_photos += len(photo_batches[batch_index])
+                        print(f"Batch {batch_index + 1} timed out - moving to next batch")
                     except Exception as e:
-                        last_error = str(e)
-                        retry_count += 1
-                        if retry_count < MAX_RETRIES:
-                            logging.warning(f"Transfer attempt {retry_count} failed for '{photo_title}': {last_error}")
-                        else:
-                            failed_photos += 1
-                            error_message = f"Media {i}/{total_photos}: '{photo_title}' - transfer failed after {MAX_RETRIES} attempts ✗ ({last_error})"
-                            print(error_message)
-                            logging.error(error_message)
+                        logging.error(f"Batch processing error: {str(e)}")
+                        batch_index = futures.index(future)
+                        failed_photos += len(photo_batches[batch_index])
                 
-                if not transfer_success and retry_count >= MAX_RETRIES:
-                    continue
+                # Check for unfinished futures
+                unfinished_futures = set(futures) - set(completed_futures)
+                if unfinished_futures:
+                    unfinished_count = len(unfinished_futures)
+                    total_futures = len(futures)
+                    logging.warning(f"{unfinished_count} (of {total_futures}) futures unfinished")
+                    print(f"\nWarning: {unfinished_count} batches did not complete successfully")
+                    
+                    # Cancel unfinished futures
+                    for future in unfinished_futures:
+                        future.cancel()
+                        batch_index = futures.index(future)
+                        failed_photos += len(photo_batches[batch_index])
+                
+            except KeyboardInterrupt:
+                logging.info("Received interrupt signal, initiating graceful shutdown")
+                self.shutdown_event.set()
+                # Cancel pending futures
+                for future in futures:
+                    future.cancel()
+                print("\nGracefully shutting down... (this may take a moment)")
+                return {
+                    'album_name': album_name,
+                    'total': total_photos,
+                    'transferred': transferred_photos,
+                    'skipped': skipped_photos,
+                    'failed': failed_photos,
+                    'status': 'interrupted'
+                }
+                
+            finally:
+                if executor:
+                    print("Shutting down executor...")
+                    executor.shutdown(wait=True, cancel_futures=True)
+                    print("Executor shutdown complete")
             
             summary_message = (
                 f"\nTransfer summary for album '{album_name}':\n"
@@ -356,73 +454,322 @@ class PhotoTransferer:
             print(summary_message)
             logging.info(summary_message)
             
-            logging.info(f"Album transfer complete: {album_name}")
-            logging.info(f"Summary - Total: {total_photos}, Transferred: {transferred_photos}, "
-                        f"Skipped: {skipped_photos}, Failed: {failed_photos}")
-            
             return {
-                'album_name': flickr_album['title']['_content'],
+                'album_name': album_name,
                 'total': total_photos,
                 'transferred': transferred_photos,
                 'skipped': skipped_photos,
                 'failed': failed_photos
             }
             
-        except APIQuotaExceeded as e:
-            logging.warning(str(e))
-            raise
         except Exception as e:
-            logging.error(f"Error during album transfer: {str(e)}")
+            logging.error(f"Error transferring album {album_name}: {str(e)}")
             raise
+        finally:
+            if executor:
+                try:
+                    executor.shutdown(wait=False)
+                except Exception as e:
+                    logging.error(f"Error shutting down executor: {str(e)}")
 
-    def _upload_to_google_photos(self, photo_bytes, album_id):
-        """
-        Upload a photo to Google Photos and add it to the album
-        """
-        try:
-            logging.info(f"Starting photo upload to album ID: {album_id}")
+    def _process_photo_batch(self, photos, album_id, existing_photos):
+        """Process a batch of photos with improved memory management"""
+        results = []
+        thread_id = threading.get_ident()
+        
+        logging.info(f"Starting batch processing in thread {thread_id}")
+        
+        for photo in photos:
+            session = None
+            content = None
+            photo_info = None
             
-            # 1. Upload the photo
-            upload_url = 'https://photoslibrary.googleapis.com/v1/uploads'
-            headers = {
-                'Authorization': f'Bearer {self.credentials.token}',
-                'Content-Type': 'application/octet-stream',
-                'X-Goog-Upload-Protocol': 'raw'
+            try:
+                with self.upload_semaphore:
+                    # Récupérer les infos de la photo dans un bloc try séparé
+                    try:
+                        photo_info = self.flickr.photos.getInfo(photo_id=photo['id'])
+                        photo_title = photo_info['photo']['title']['_content']
+                        logging.info(f"Processing file:")
+                        logging.info(f"  - Original Flickr title: {photo_title}")
+                        logging.info(f"  - Flickr photo ID: {photo['id']}")
+                        
+                        # Amélioration de la vérification des doublons
+                        clean_name = self._normalize_filename(photo_title)
+                        
+                        # Log détaillé pour le débogage
+                        logging.info(f"Checking if photo exists: {photo_title}")
+                        logging.info(f"Normalized name: {clean_name}")
+                        
+                        # Vérification plus stricte
+                        photo_exists = False
+                        for existing_photo in existing_photos:
+                            if (existing_photo['clean_name'] == clean_name or
+                                existing_photo['original_name'] == photo_title):
+                                photo_exists = True
+                                logging.info(f"Found match:")
+                                logging.info(f"  - Existing: {existing_photo['original_name']}")
+                                logging.info(f"  - New: {photo_title}")
+                                break
+                        
+                        if photo_exists:
+                            logging.info(f"Skipping duplicate: {photo_title}")
+                            results.append({
+                                'photo_id': photo['id'],
+                                'status': 'skipped',
+                                'error': None
+                            })
+                            continue
+                            
+                        # Récupérer les tailles disponibles
+                        sizes = self.flickr.photos.getSizes(photo_id=photo['id'])
+                        if 'sizes' in sizes and 'size' in sizes['sizes']:
+                            available_sizes = sizes['sizes']['size']
+                            logging.info(f"  - Available sizes: {[size['label'] for size in available_sizes]}")
+                            
+                            # Trier par taille décroissante
+                            available_sizes.sort(key=lambda x: int(x.get('width', 0) or 0), reverse=True)
+                            best_quality = available_sizes[0]
+                            media_url = best_quality['source']
+                            logging.info(f"  - Selected photo size: {best_quality['label']}")
+                            logging.info(f"  - Media URL: {media_url}")
+                            
+                            # Créer une nouvelle session pour chaque téléchargement
+                            session = requests.Session()
+                            adapter = requests.adapters.HTTPAdapter(max_retries=3)
+                            session.mount('http://', adapter)
+                            session.mount('https://', adapter)
+                            
+                            # Télécharger avec gestion de la mémoire
+                            with session.get(media_url, stream=True, timeout=300) as response:
+                                response.raise_for_status()
+                                content = response.content
+                                
+                                # Upload immédiat après téléchargement
+                                if content:
+                                    upload_result = self._upload_to_google_photos(content, album_id, photo_info=photo_info)
+                                    if upload_result:
+                                        print(f"Media: '{photo_title}' - transferred successfully ↑")
+                                        logging.info(f"  - Successfully uploaded to Google Photos")
+                                        results.append({
+                                            'photo_id': photo['id'],
+                                            'status': 'transferred',
+                                            'error': None
+                                        })
+                                    else:
+                                        raise Exception("Upload failed")
+                                else:
+                                    raise Exception("Downloaded content is empty")
+                                
+                    except Exception as e:
+                        error_msg = f"Media: '{photo_title if 'photo_title' in locals() else 'Unknown'}' - transfer failed ✗ ({str(e)})"
+                        print(error_msg)
+                        logging.error(error_msg)
+                        results.append({
+                            'photo_id': photo['id'],
+                            'status': 'failed',
+                            'error': str(e)
+                        })
+                        
+            finally:
+                # Nettoyage explicite des ressources
+                if session:
+                    session.close()
+                if content:
+                    del content
+                if photo_info:
+                    del photo_info
+                session = None
+                content = None
+                photo_info = None
+        
+        return results
+
+    def _upload_to_google_photos(self, photo_bytes, album_id, photo_info=None):
+        """Upload with improved error handling and memory management"""
+        MAX_RETRIES = 3
+        retry_count = 0
+        thread_id = threading.get_ident()
+        local_session = None
+
+        try:
+            # Get photo details for better logging
+            photo_title = photo_info['photo']['title']['_content'] if photo_info else 'Unknown'
+            photo_id = photo_info['photo']['id'] if photo_info else 'Unknown'
+            
+            # Determine file type and validate
+            content_type = None
+            extension = photo_title.lower().split('.')[-1] if '.' in photo_title else 'jpg'
+            
+            # Map extensions to MIME types
+            mime_types = {
+                'jpg': 'image/jpeg',
+                'jpeg': 'image/jpeg',
+                'png': 'image/png',
+                'gif': 'image/gif',
+                'bmp': 'image/bmp',
+                'webp': 'image/webp',
+                'heic': 'image/heic',
+                'tiff': 'image/tiff',
+                'mp4': 'video/mp4',
+                'mov': 'video/quicktime',
+                'avi': 'video/x-msvideo'
             }
+            
+            content_type = mime_types.get(extension, 'image/jpeg')
+            
+            # Ensure filename ends with correct extension
+            if not photo_title.lower().endswith(f'.{extension}'):
+                photo_title = f"{photo_title}.{extension}"
+            
+            logging.info(f"Thread {thread_id} - Starting upload:")
+            logging.info(f"  - Photo ID: {photo_id}")
+            logging.info(f"  - Title: {photo_title}")
+            logging.info(f"  - Content Type: {content_type}")
+            logging.info(f"  - Size: {len(photo_bytes) / 1024 / 1024:.2f} MB")
 
-            upload_response = requests.post(upload_url, data=photo_bytes, headers=headers)
-            upload_response.raise_for_status()
-            upload_token = upload_response.content.decode('utf-8')
-            logging.info("Upload token obtained successfully")
+            while retry_count < MAX_RETRIES:
+                try:
+                    # Refresh token if needed
+                    if not self.credentials.valid:
+                        self.credentials.refresh(Request())
 
-            # 2. Create media item
-            request_body = {
-                'newMediaItems': [{
-                    'simpleMediaItem': {
-                        'uploadToken': upload_token
+                    # Create new session for each attempt
+                    local_session = requests.Session()
+                    adapter = requests.adapters.HTTPAdapter(
+                        max_retries=3,
+                        pool_connections=1,
+                        pool_maxsize=1
+                    )
+                    local_session.mount('https://', adapter)
+                    
+                    # First stage: Upload bytes
+                    headers = {
+                        'Authorization': f'Bearer {self.credentials.token}',
+                        'Content-Type': 'application/octet-stream',
+                        'X-Goog-Upload-Protocol': 'raw',
+                        'X-Goog-Upload-Content-Type': content_type,
+                        'X-Goog-Upload-File-Name': photo_title,
+                        'User-Agent': 'flickr-to-google-photos/1.0',
+                        'Accept': '*/*'
                     }
-                }]
-            }
 
-            # 3. Create item in Google Photos with album ID
-            request_body['albumId'] = album_id  # Add album ID directly to creation request
+                    logging.info(f"Thread {thread_id} - Starting upload request...")
+                    logging.info(f"Thread {thread_id} - Request details:")
+                    logging.info(f"  - URL: https://photoslibrary.googleapis.com/v1/uploads")
+                    logging.info(f"  - Headers:")
+                    for key, value in headers.items():
+                        # Ne pas logger le token complet pour des raisons de sécurité
+                        if key == 'Authorization':
+                            value = value[:30] + '...'
+                        logging.info(f"    {key}: {value}")
+                    logging.info(f"  - Data size: {len(photo_bytes)} bytes")
+                    
+                    # Use a copy of photo_bytes to prevent memory issues
+                    upload_data = photo_bytes[:]
+                    response = local_session.post(
+                        'https://photoslibrary.googleapis.com/v1/uploads',
+                        data=upload_data,
+                        headers=headers,
+                        timeout=60,
+                        verify=True
+                    )
+                    
+                    logging.info(f"Thread {thread_id} - Response details:")
+                    logging.info(f"  - Status code: {response.status_code}")
+                    logging.info(f"  - Response headers:")
+                    for key, value in response.headers.items():
+                        logging.info(f"    {key}: {value}")
+                    
+                    response.raise_for_status()
+                    upload_token = response.content.decode('utf-8')
+                    
+                    if not upload_token:
+                        raise Exception("Empty upload token received")
+                    
+                    logging.info(f"Thread {thread_id} - Upload token obtained: {upload_token[:10]}...")
 
-            response = self.google_photos.mediaItems().batchCreate(
-                body=request_body
-            ).execute()
+                    # Clear response data
+                    response = None
+                    upload_data = None
 
-            if not response.get('newMediaItemResults'):
-                raise Exception("Failed to create media item")
+                    # Second stage: Create media item with rate limiting
+                    time.sleep(self.write_request_delay)  # Attendre ~2 secondes entre chaque requête
 
-            status = response['newMediaItemResults'][0]['status']
-            if status.get('message') == 'Success':
-                logging.info(f"Photo successfully added to album ID: {album_id}")
-            else:
-                logging.error(f"Failed to add photo to album: {status.get('message')}")
-                raise Exception(f"Upload error: {status.get('message')}")
+                    request_body = {
+                        'newMediaItems': [{
+                            'simpleMediaItem': {
+                                'uploadToken': upload_token
+                            }
+                        }],
+                        'albumId': album_id
+                    }
 
-            return True
+                    batch_create_url = 'https://photoslibrary.googleapis.com/v1/mediaItems:batchCreate'
+                    batch_headers = {
+                        'Content-Type': 'application/json',
+                        'Authorization': f'Bearer {self.credentials.token}'
+                    }
 
-        except Exception as e:
-            logging.error(f"Error uploading to Google Photos: {str(e)}")
-            raise
+                    batch_response = local_session.post(
+                        batch_create_url,
+                        json=request_body,
+                        headers=batch_headers,
+                        timeout=60
+                    )
+
+                    if batch_response.status_code == 429:  # Too Many Requests
+                        retry_after = int(batch_response.headers.get('Retry-After', 60))
+                        logging.info(f"Rate limit hit, waiting {retry_after} seconds")
+                        time.sleep(retry_after)
+                        continue
+
+                    batch_response.raise_for_status()
+                    result = batch_response.json()
+
+                    if not result.get('newMediaItemResults'):
+                        raise Exception("No results returned")
+
+                    result = result['newMediaItemResults'][0]
+                    status = result.get('status', {})
+
+                    if status.get('message') == 'Success':
+                        if 'mediaItem' in result:
+                            media_item = result['mediaItem']
+                            logging.info(f"Thread {thread_id} - Upload successful:")
+                            logging.info(f"  - Media ID: {media_item.get('id')}")
+                            logging.info(f"  - Google filename: {media_item.get('filename')}")
+                            logging.info(f"  - Original filename: {photo_title}")
+                            logging.info(f"  - Successfully uploaded to Google Photos")
+                        return True
+                    else:
+                        raise Exception(f"Upload error: {status.get('message')}")
+
+                except Exception as e:
+                    retry_count += 1
+                    logging.error(f"Thread {thread_id} - Attempt {retry_count} failed:")
+                    logging.error(f"  - Photo: {photo_title}")
+                    logging.error(f"  - Error: {str(e)}")
+                    if hasattr(e, 'response'):
+                        logging.error(f"  - Response status code: {e.response.status_code}")
+                        logging.error(f"  - Response content: {e.response.content}")
+                    
+                    if retry_count < MAX_RETRIES:
+                        wait_time = (2 ** retry_count)
+                        logging.info(f"Thread {thread_id} - Waiting {wait_time}s before retry...")
+                        time.sleep(wait_time)
+                    else:
+                        raise Exception(f"Failed after {MAX_RETRIES} attempts: {str(e)}")
+
+                finally:
+                    # Clean up session
+                    if local_session:
+                        local_session.close()
+                        local_session = None
+
+        finally:
+            # Final cleanup
+            if local_session:
+                local_session.close()
+
+        return False
